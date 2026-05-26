@@ -1,36 +1,31 @@
 /**
- * Auth Controller — Wallet Signature Verification
+ * Auth Controller — Wallet Signature Verification + Session Management
  *
- * Implements a challenge-response authentication flow:
- *   1. POST /api/auth/nonce   — generate a one-time nonce for an address
- *   2. POST /api/auth/verify  — verify the signed nonce, issue JWT
- *   3. POST /api/auth/refresh — refresh an expiring JWT
- *   4. POST /api/auth/logout  — invalidate the session
- *
- * Signature verification uses @stellar/stellar-sdk's Keypair to verify
- * that the provided signature was produced by the private key corresponding
- * to the claimed Stellar public address.
+ * Flow:
+ *   POST /api/auth/nonce            — generate one-time challenge nonce
+ *   POST /api/auth/verify           — verify signature, issue JWT with jti
+ *   POST /api/auth/refresh          — refresh valid JWT, rotate session
+ *   POST /api/auth/logout           — revoke current session
+ *   GET  /api/auth/sessions         — list active sessions (auth required)
+ *   DELETE /api/auth/sessions/:jti  — revoke specific session (auth required)
+ *   DELETE /api/auth/sessions       — revoke all sessions / global logout
  */
 
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
+import sessionService from '../../services/sessionService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_in_production';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
-const NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const NONCE_TTL_MS = 5 * 60 * 1000;
 
-// In-memory nonce store — replace with Redis in production
-const nonceStore = new Map(); // address → { nonce, expiresAt }
+const nonceStore = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isValidStellarAddress(address) {
-  try {
-    return StrKey.isValidEd25519PublicKey(address);
-  } catch {
-    return false;
-  }
+  try { return StrKey.isValidEd25519PublicKey(address); } catch { return false; }
 }
 
 function generateNonce() {
@@ -41,139 +36,134 @@ function buildChallengeMessage(address, nonce) {
   return `Sign this message to authenticate with StellarTrustEscrow.\n\nAddress: ${address}\nNonce: ${nonce}\nTimestamp: ${Date.now()}`;
 }
 
-/**
- * Verifies a Stellar ed25519 signature.
- * The frontend signs the raw challenge string (not a transaction XDR).
- *
- * @param {string} address   — Stellar G... public key
- * @param {string} message   — the original challenge message
- * @param {string} signature — base64-encoded ed25519 signature
- * @returns {boolean}
- */
 function verifySignature(address, message, signature) {
   try {
     const keypair = Keypair.fromPublicKey(address);
-    const msgBuffer = Buffer.from(message, 'utf8');
-    const sigBuffer = Buffer.from(signature, 'base64');
-    return keypair.verify(msgBuffer, sigBuffer);
-  } catch {
-    return false;
-  }
+    return keypair.verify(Buffer.from(message, 'utf8'), Buffer.from(signature, 'base64'));
+  } catch { return false; }
 }
 
-// ── Controllers ───────────────────────────────────────────────────────────────
+function getClientIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ?? req.socket?.remoteAddress ?? '';
+}
 
-/**
- * POST /api/auth/nonce
- * Body: { address: string }
- *
- * Generates a one-time nonce for the given Stellar address and returns
- * the challenge message the user must sign.
- */
+function signJwt(payload, jti) {
+  return jwt.sign({ ...payload, jti }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+// ── Nonce ─────────────────────────────────────────────────────────────────────
+
 export const getNonce = (req, res) => {
   const { address } = req.body;
-
   if (!address || !isValidStellarAddress(address)) {
     return res.status(400).json({ error: 'Valid Stellar address required' });
   }
-
   const nonce = generateNonce();
   const message = buildChallengeMessage(address, nonce);
-  const expiresAt = Date.now() + NONCE_TTL_MS;
-
-  nonceStore.set(address, { nonce, message, expiresAt });
-
-  // Auto-expire from store
+  nonceStore.set(address, { nonce, message, expiresAt: Date.now() + NONCE_TTL_MS });
   setTimeout(() => nonceStore.delete(address), NONCE_TTL_MS);
-
-  return res.json({
-    address,
-    nonce,
-    message,
-    expiresIn: NONCE_TTL_MS / 1000,
-  });
+  return res.json({ address, nonce, message, expiresIn: NONCE_TTL_MS / 1000 });
 };
 
-/**
- * POST /api/auth/verify
- * Body: { address: string, signature: string }
- *
- * Verifies the signature against the stored nonce challenge.
- * Issues a JWT on success and invalidates the nonce.
- */
-export const verifySignatureAndLogin = (req, res) => {
-  const { address, signature } = req.body;
+// ── Verify & Login ────────────────────────────────────────────────────────────
 
+export const verifySignatureAndLogin = async (req, res) => {
+  const { address, signature } = req.body;
   if (!address || !isValidStellarAddress(address)) {
     return res.status(400).json({ error: 'Valid Stellar address required' });
   }
-  if (!signature || typeof signature !== 'string') {
-    return res.status(400).json({ error: 'Signature required' });
-  }
+  if (!signature) return res.status(400).json({ error: 'Signature required' });
 
   const stored = nonceStore.get(address);
-  if (!stored) {
-    return res.status(401).json({ error: 'No pending nonce for this address. Request a new one.' });
-  }
+  if (!stored) return res.status(401).json({ error: 'No pending nonce. Request a new one.' });
   if (Date.now() > stored.expiresAt) {
     nonceStore.delete(address);
     return res.status(401).json({ error: 'Nonce expired. Request a new one.' });
   }
 
   const valid = verifySignature(address, stored.message, signature);
+  nonceStore.delete(address); // always consume
 
-  // Always consume the nonce — prevents replay attacks
-  nonceStore.delete(address);
+  if (!valid) return res.status(401).json({ error: 'Signature verification failed' });
 
-  if (!valid) {
-    return res.status(401).json({ error: 'Signature verification failed' });
-  }
-
-  const token = jwt.sign(
-    { address, iat: Math.floor(Date.now() / 1000) },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN },
-  );
-
-  return res.json({
-    token,
+  const jti = await sessionService.createSession({
     address,
+    userAgent: req.headers['user-agent'],
+    ipAddress: getClientIp(req),
     expiresIn: JWT_EXPIRES_IN,
   });
+
+  const token = signJwt({ address }, jti);
+  return res.json({ token, address, expiresIn: JWT_EXPIRES_IN, sessionId: jti });
 };
 
-/**
- * POST /api/auth/refresh
- * Header: Authorization: Bearer <token>
- *
- * Issues a fresh JWT if the current one is still valid.
- */
-export const refreshToken = (req, res) => {
+// ── Refresh ───────────────────────────────────────────────────────────────────
+
+export const refreshToken = async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Bearer token required' });
   }
-
-  const token = authHeader.slice(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const newToken = jwt.sign(
-      { address: payload.address },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRES_IN },
-    );
-    return res.json({ token: newToken, address: payload.address, expiresIn: JWT_EXPIRES_IN });
-  } catch (err) {
+    const payload = jwt.verify(authHeader.slice(7), JWT_SECRET);
+    // Revoke old session, create new one
+    if (payload.jti) await sessionService.revokeSession(payload.jti);
+    const jti = await sessionService.createSession({
+      address: payload.address,
+      userAgent: req.headers['user-agent'],
+      ipAddress: getClientIp(req),
+      expiresIn: JWT_EXPIRES_IN,
+    });
+    const token = signJwt({ address: payload.address }, jti);
+    return res.json({ token, address: payload.address, expiresIn: JWT_EXPIRES_IN });
+  } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 
-/**
- * POST /api/auth/logout
- * Stateless JWT — client discards the token. Returns 200 for UX consistency.
- */
-export const logout = (_req, res) => {
-  res.json({ ok: true });
+// ── Logout ────────────────────────────────────────────────────────────────────
+
+export const logout = async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(authHeader.slice(7), JWT_SECRET);
+      if (payload.jti) await sessionService.revokeSession(payload.jti);
+    } catch { /* expired token — still return 200 */ }
+  }
+  return res.json({ ok: true });
 };
 
-export default { getNonce, verifySignatureAndLogin, refreshToken, logout };
+// ── Session management ────────────────────────────────────────────────────────
+
+export const listSessions = async (req, res) => {
+  try {
+    const sessions = await sessionService.listSessions(req.user.address);
+    return res.json({ data: sessions });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export const revokeSession = async (req, res) => {
+  try {
+    await sessionService.revokeSession(req.params.jti);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export const revokeAllSessions = async (req, res) => {
+  try {
+    await sessionService.revokeAllSessions(req.user.address);
+    return res.json({ ok: true, message: 'All sessions revoked' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export default {
+  getNonce, verifySignatureAndLogin, refreshToken, logout,
+  listSessions, revokeSession, revokeAllSessions,
+};
