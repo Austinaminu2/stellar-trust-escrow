@@ -1,18 +1,17 @@
 import express from 'express';
-import { getNonce, verifySignatureAndLogin, refreshToken, logout } from '../controllers/authController.js';
+import authController from '../controllers/authController.js';
+import authMiddleware from '../middleware/auth.js';
 
 const router = express.Router();
 
-/** POST /api/auth/nonce — request a challenge nonce */
-router.post('/nonce', getNonce);
+router.post('/nonce', authController.getNonce);
+router.post('/verify', authController.verifySignatureAndLogin);
+router.post('/refresh', authController.refreshToken);
+router.post('/logout', authController.logout);
 
-/** POST /api/auth/verify — submit signed nonce, receive JWT */
-router.post('/verify', verifySignatureAndLogin);
-
-/** POST /api/auth/refresh — refresh a valid JWT */
-router.post('/refresh', refreshToken);
-
-/** POST /api/auth/logout */
-router.post('/logout', logout);
+// Session management — requires valid JWT
+router.get('/sessions', authMiddleware, authController.listSessions);
+router.delete('/sessions', authMiddleware, authController.revokeAllSessions);
+router.delete('/sessions/:jti', authMiddleware, authController.revokeSession);
 
 export default router;
